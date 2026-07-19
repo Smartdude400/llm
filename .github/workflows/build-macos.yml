@@ -31,7 +31,7 @@ jobs:
       - name: Build small model (dim 64, 2 layers) with Accelerate
         run: |
           clang -O3 -ffast-math -DCTX=128 -DBATCH=16 \
-                -pthread -DNTHREADS=4 \
+                -pthread -DNTHREADS=512 \
                 -DUSE_BLAS -framework Accelerate \
                 -o tinyllm tinyllm.c
           file tinyllm
