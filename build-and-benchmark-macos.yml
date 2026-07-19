@@ -1,0 +1,94 @@
+name: build-and-benchmark-macos
+
+# Runs on a real Apple Silicon Mac (free for public repos) and does two jobs:
+#   1. builds the fast native C binary with Accelerate -> download it (~100 KB)
+#   2. benchmarks C vs MLX on M-series hardware -> tells you which is faster
+#
+# Nothing needs installing on your own machine. Put this at
+# .github/workflows/build-and-benchmark-macos.yml alongside tinyllm.c and
+# tinyllm_mlx.py, then Actions -> Run workflow.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "tinyllm.c"
+      - "tinyllm_mlx.py"
+      - ".github/workflows/build-and-benchmark-macos.yml"
+
+jobs:
+  build:
+    runs-on: macos-14            # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Machine info
+        run: |
+          uname -m
+          sysctl -n machdep.cpu.brand_string || true
+          sysctl -n hw.perflevel0.logicalcpu || sysctl -n hw.ncpu
+          clang --version | head -1
+
+      # ---------------------------------------------------------------- C
+      - name: Build C with Accelerate
+        run: |
+          clang -O3 -ffast-math -DCTX=128 -DBATCH=16 \
+                -pthread -DNTHREADS=4 \
+                -DUSE_BLAS -framework Accelerate \
+                -o tinyllm tinyllm.c
+          file tinyllm
+
+      - name: Verify C math
+        run: ./tinyllm check tinyllm.c
+
+      - name: C speed - small model (dim 64, 2 layers)
+        run: ./tinyllm train tinyllm.c /tmp/a.bin 60
+
+      - name: Build and time C at the larger size (dim 256, 4 layers)
+        run: |
+          clang -O3 -ffast-math -DDIM=256 -DNLAYER=4 -DCTX=128 -DBATCH=16 \
+                -pthread -DNTHREADS=4 -DUSE_BLAS -framework Accelerate \
+                -o tinyllm-big tinyllm.c
+          ./tinyllm-big check tinyllm.c
+          ./tinyllm-big train tinyllm.c /tmp/b.bin 40
+
+      # -------------------------------------------------------------- MLX
+      # Non-fatal: if the runner VM exposes no Metal GPU, we still want the
+      # binary. A failure here is itself a useful result.
+      - name: Install MLX
+        id: mlx_install
+        continue-on-error: true
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install mlx numpy
+          python3 -c "import mlx.core as mx; print('mlx ok', mx.__version__ if hasattr(mx,'__version__') else '')"
+
+      - name: Verify MLX model definition
+        if: steps.mlx_install.outcome == 'success'
+        continue-on-error: true
+        run: python3 tinyllm_mlx.py check
+
+      - name: MLX speed - small model (dim 64, 2 layers)
+        if: steps.mlx_install.outcome == 'success'
+        continue-on-error: true
+        run: python3 tinyllm_mlx.py bench 30 --dim 64 --layers 2 --ctx 128 --batch 16
+
+      - name: MLX speed - larger model (dim 256, 4 layers)
+        if: steps.mlx_install.outcome == 'success'
+        continue-on-error: true
+        run: python3 tinyllm_mlx.py bench 30 --dim 256 --layers 4 --ctx 128 --batch 16
+
+      # ------------------------------------------------------------ output
+      - name: Also build a no-BLAS fallback
+        run: |
+          clang -O3 -ffast-math -DCTX=128 -DBATCH=16 -pthread -DNTHREADS=4 \
+                -o tinyllm-noblas tinyllm.c
+          ./tinyllm-noblas check tinyllm.c
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tinyllm-macos-arm64
+          path: |
+            tinyllm
+            tinyllm-big
+            tinyllm-noblas
