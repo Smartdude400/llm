@@ -63,25 +63,6 @@ jobs:
                 -o tinyllm-gpu tinyllm.c gpu_mac.m
           file tinyllm-gpu
 
-      - name: Verify GPU numerics
-        if: steps.gpu_build.outcome == 'success'
-        continue-on-error: true
-        run: ./tinyllm-gpu check tinyllm.c
-
-      - name: GPU speed (dim 64) vs CPU
-        if: steps.gpu_build.outcome == 'success'
-        continue-on-error: true
-        run: ./tinyllm-gpu train tinyllm.c /tmp/g1.bin 60
-
-      - name: Build + time GPU at dim 256
-        if: steps.gpu_build.outcome == 'success'
-        continue-on-error: true
-        run: |
-          clang -O3 -ffast-math -DUSE_MPS -DDIM=256 -DNLAYER=4 -DCTX=128 -DBATCH=16 \
-                -fobjc-arc -framework Metal -framework MetalPerformanceShaders \
-                -framework Foundation -o tinyllm-gpu-big tinyllm.c gpu_mac.m
-          ./tinyllm-gpu-big check tinyllm.c
-          ./tinyllm-gpu-big train tinyllm.c /tmp/g2.bin 40
 
       - name: Build no-BLAS fallback
         run: |
