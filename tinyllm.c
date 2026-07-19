@@ -27,7 +27,7 @@
  *      ./tinyllm gen   model.bin "def " 400 0.5
  *      ./tinyllm check data.txt                  # verify the backward pass
  *
- *  Every knob is -D overridable: DIM, NLAYER, NHEAD, CTX, BATCH, LR,
+ *  Every knob is -D overridable: DIM, NLAYER, NHEAD, CTX, BATCH, LEARN_RATE,
  *  NTHREADS. BATCH must be divisible by NTHREADS. Use CTX=128 for source
  *  code — 64 characters is about one line, too short to track indentation.
  *
@@ -42,6 +42,39 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <sys/time.h>
+
+/* ---------------------------------------------------------------------
+ * ALL system headers must be included BEFORE this file's #defines.
+ * Apple's Accelerate pulls in CarbonCore, whose MachineExceptions.h has a
+ * struct field literally named LR -- so a `#define LR` above this point
+ * rewrites it to `UnsignedWide 1e-3f;` and the SDK fails to parse. Short
+ * macro names and system headers do not mix; keep the includes on top.
+ * ------------------------------------------------------------------ */
+#ifndef NTHREADS
+#define NTHREADS 1          /* compile with -pthread -DNTHREADS=2 (or 4) */
+#endif
+#if NTHREADS > 1
+#include <pthread.h>
+#endif
+
+/* Optional BLAS for the matmuls. On macOS this is Apple's Accelerate, which
+ * uses the AMX matrix coprocessor on Apple Silicon:
+ *     cc -O3 -DUSE_BLAS -framework Accelerate -o tinyllm tinyllm.c
+ * On Linux the identical CBLAS API comes from OpenBLAS:
+ *     cc -O3 -DUSE_BLAS -o tinyllm tinyllm.c -lopenblas -lm            */
+#ifdef USE_BLAS
+#ifdef __APPLE__
+/* Apple deprecated the classic CBLAS prototypes in macOS 13.3; this selects
+ * the supported headers. Drop it if you are on an older macOS. */
+#ifndef ACCELERATE_NEW_LAPACK
+#define ACCELERATE_NEW_LAPACK 1
+#endif
+#include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
+#endif
+#endif
 
 /* ------------------------- model size knobs ------------------------- */
 /* All knobs are -D overridable: cc -O3 -DCTX=128 -DBATCH=16 ... */
@@ -65,36 +98,20 @@
 #ifndef BATCH
 #define BATCH        4
 #endif
-#ifndef LR
-#define LR           1e-3f
+/* Named in full on purpose: a command-line -DLR would be live while the
+ * system headers are parsed, and Apple's MachineExceptions.h has a struct
+ * field called LR. Short knob names are a landmine; long ones are free. */
+#ifndef LEARN_RATE
+#define LEARN_RATE   1e-3f
 #endif
-#define WD           1e-4f  /* AdamW weight decay                       */
+#ifndef WEIGHT_DECAY
+#define WEIGHT_DECAY 1e-4f  /* AdamW weight decay                       */
+#endif
 #define CKPT_EVERY   100    /* save checkpoint every N steps            */
 #define SAMPLE_EVERY 250    /* print a text sample every N steps        */
 #define RMS_EPS      1e-5f
 
-#ifndef NTHREADS
-#define NTHREADS 1          /* compile with -pthread -DNTHREADS=2 (or 4) */
-#endif
-#if NTHREADS > 1
-#include <pthread.h>
-#endif
 _Static_assert(BATCH % NTHREADS == 0, "BATCH must be divisible by NTHREADS");
-
-/* Optional BLAS for the matmuls. On macOS this is Apple's Accelerate, which
- * uses the AMX matrix coprocessor on Apple Silicon:
- *     cc -O3 -DUSE_BLAS -framework Accelerate -o tinyllm tinyllm.c
- * On Linux the identical CBLAS API comes from OpenBLAS:
- *     cc -O3 -DUSE_BLAS -o tinyllm tinyllm.c -lopenblas -lm            */
-#ifdef USE_BLAS
-#ifdef __APPLE__
-#include <Accelerate/Accelerate.h>
-#else
-#include <cblas.h>
-#endif
-#endif
-
-#include <sys/time.h>
 
 /* Monotonic wall clock: correct with threads, unlike clock().
  * clock_gettime needs macOS 10.12+ (and is hidden under strict -std=c11),
@@ -521,7 +538,7 @@ static void adamw(float *p, float *g, float *m, float *v, long n, int t) {
         m[i] = b1 * m[i] + (1.0f - b1) * g[i];
         v[i] = b2 * v[i] + (1.0f - b2) * g[i] * g[i];
         float mh = m[i] / c1, vh = v[i] / c2;
-        p[i] -= LR * (mh / (sqrtf(vh) + eps) + WD * p[i]);
+        p[i] -= LEARN_RATE * (mh / (sqrtf(vh) + eps) + WEIGHT_DECAY * p[i]);
         g[i] = 0.0f;
     }
 }
