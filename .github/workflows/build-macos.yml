@@ -1,0 +1,67 @@
+name: build-macos
+
+# Builds tinyllm natively on a real Apple Silicon Mac (free for public repos)
+# and uploads the binaries. You download ~100 KB; nothing installs locally.
+#
+#   1. create a PUBLIC repo, add tinyllm.c and this file at
+#      .github/workflows/build-macos.yml
+#   2. Actions tab -> build-macos -> Run workflow
+#   3. download the "tinyllm-macos-arm64" artifact
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "tinyllm.c"
+      - ".github/workflows/build-macos.yml"
+
+jobs:
+  build:
+    runs-on: macos-14            # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Machine info
+        run: |
+          uname -m
+          sysctl -n machdep.cpu.brand_string || true
+          echo "performance cores: $(sysctl -n hw.perflevel0.logicalcpu || sysctl -n hw.ncpu)"
+          clang --version | head -1
+
+      - name: Build small model (dim 64, 2 layers) with Accelerate
+        run: |
+          clang -O3 -ffast-math -DCTX=128 -DBATCH=16 \
+                -pthread -DNTHREADS=4 \
+                -DUSE_BLAS -framework Accelerate \
+                -o tinyllm tinyllm.c
+          file tinyllm
+
+      - name: Verify the math
+        run: ./tinyllm check tinyllm.c
+
+      - name: Speed check
+        run: ./tinyllm train tinyllm.c /tmp/a.bin 60
+
+      - name: Build large model (dim 256, 4 layers)
+        run: |
+          clang -O3 -ffast-math -DDIM=256 -DNLAYER=4 -DCTX=128 -DBATCH=16 \
+                -pthread -DNTHREADS=4 \
+                -DUSE_BLAS -framework Accelerate \
+                -o tinyllm-big tinyllm.c
+          ./tinyllm-big check tinyllm.c
+          ./tinyllm-big train tinyllm.c /tmp/b.bin 40
+
+      - name: Build no-BLAS fallback
+        run: |
+          clang -O3 -ffast-math -DCTX=128 -DBATCH=16 \
+                -pthread -DNTHREADS=4 \
+                -o tinyllm-noblas tinyllm.c
+          ./tinyllm-noblas check tinyllm.c
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tinyllm-macos-arm64
+          path: |
+            tinyllm
+            tinyllm-big
+            tinyllm-noblas
