@@ -113,7 +113,7 @@
 #define WEIGHT_DECAY 1e-4f  /* AdamW weight decay                       */
 #endif
 #define CKPT_EVERY   100    /* save checkpoint every N steps            */
-#define SAMPLE_EVERY 250    /* write a whole-program sample every N steps */
+#define SAMPLE_EVERY 10000    /* write a whole-program sample every N steps */
 #ifndef SAMPLE_BUDGET
 #define SAMPLE_BUDGET 12000 /* max bytes to spend hunting for the boundary */
 #endif
