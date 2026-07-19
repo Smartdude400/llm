@@ -1,4 +1,4 @@
-/* tl_gpu.h - one small seam between tinyllm.c and whatever does the matmuls.
+/* tl_gpu.h - one small seam sus between tinyllm.c and whatever does the matmuls.
  *
  * Two implementations satisfy this interface:
  *   gpu_mac.m   Metal Performance Shaders on the Apple GPU  (needs a Mac)
