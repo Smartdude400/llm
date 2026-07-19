@@ -43,6 +43,7 @@
 #include <math.h>
 #include <time.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 /* ---------------------------------------------------------------------
  * ALL system headers must be included BEFORE this file's #defines.
@@ -63,6 +64,10 @@
  *     cc -O3 -DUSE_BLAS -framework Accelerate -o tinyllm tinyllm.c
  * On Linux the identical CBLAS API comes from OpenBLAS:
  *     cc -O3 -DUSE_BLAS -o tinyllm tinyllm.c -lopenblas -lm            */
+#ifdef USE_MPS
+#include "tl_gpu.h"
+#endif
+
 #ifdef USE_BLAS
 #ifdef __APPLE__
 /* Apple deprecated the classic CBLAS prototypes in macOS 13.3; this selects
@@ -108,7 +113,10 @@
 #define WEIGHT_DECAY 1e-4f  /* AdamW weight decay                       */
 #endif
 #define CKPT_EVERY   100    /* save checkpoint every N steps            */
-#define SAMPLE_EVERY 250    /* print a text sample every N steps        */
+#define SAMPLE_EVERY 250    /* write a whole-program sample every N steps */
+#ifndef SAMPLE_BUDGET
+#define SAMPLE_BUDGET 12000 /* max bytes to spend hunting for the boundary */
+#endif
 #define RMS_EPS      1e-5f
 
 _Static_assert(BATCH % NTHREADS == 0, "BATCH must be divisible by NTHREADS");
@@ -193,9 +201,24 @@ static void map_params(Params *p, float *buf) {
 }
 
 static float *xcalloc(long n) {
+#ifdef USE_MPS
+    /* Metal can wrap host memory with no copy only if it is page-aligned and
+     * a whole number of pages long, so every buffer is allocated that way and
+     * handed to the backend immediately. */
+    long pagesize = (long)sysconf(_SC_PAGESIZE);
+    long bytes = ((long)n * (long)sizeof(float) + pagesize - 1) / pagesize * pagesize;
+    void *raw = NULL;
+    if (posix_memalign(&raw, (size_t)pagesize, (size_t)bytes) != 0 || !raw) {
+        fprintf(stderr, "out of memory (%ld floats)\n", n); exit(1);
+    }
+    memset(raw, 0, (size_t)bytes);
+    tl_gpu_register(raw, bytes);
+    return (float *)raw;
+#else
     float *p = calloc((size_t)n, sizeof(float));
     if (!p) { fprintf(stderr, "out of memory (%ld floats)\n", n); exit(1); }
     return p;
+#endif
 }
 
 static void init_params(float *buf) {
@@ -251,7 +274,11 @@ static void alloc_acts(Acts *A, int B) {
  * Processing 4 positions per pass loads each weight row once per 4 outputs. */
 static void mm_fwd(float *restrict Y, const float *restrict X,
                    const float *restrict W, int n, int out, int in) {
-#ifdef USE_BLAS
+#if defined(USE_MPS)
+    /* Y[n x out] = X[n x in] * W[out x in]^T */
+    tl_gpu_sgemm(0, 1, n, out, in, 1.0f, X, in, W, in, 0.0f, Y, out);
+    tl_gpu_sync();                 /* host code reads Y immediately */
+#elif defined(USE_BLAS)
     /* Y[n x out] = X[n x in] * W[out x in]^T */
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 n, out, in, 1.0f, X, in, W, in, 0.0f, Y, out);
@@ -286,7 +313,11 @@ static void mm_fwd(float *restrict Y, const float *restrict X,
 /* GW += dY^T · X  (weight gradient over n positions) */
 static void mm_gw(float *restrict GW, const float *restrict dY,
                   const float *restrict X, int n, int out, int in) {
-#ifdef USE_BLAS
+#if defined(USE_MPS)
+    /* GW[out x in] += dY[n x out]^T * X[n x in]; no sync, the optimizer
+     * syncs once before it reads the gradients. */
+    tl_gpu_sgemm(1, 0, out, in, n, 1.0f, dY, out, X, in, 1.0f, GW, in);
+#elif defined(USE_BLAS)
     /* GW[out x in] += dY[n x out]^T * X[n x in] */
     cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
                 out, in, n, 1.0f, dY, out, X, in, 1.0f, GW, in);
@@ -316,7 +347,11 @@ static void mm_gw(float *restrict GW, const float *restrict dY,
 /* dX[p] = dY[p] · W  (input gradient, overwrites dX) */
 static void mm_gx(float *restrict dX, const float *restrict dY,
                   const float *restrict W, int n, int out, int in) {
-#ifdef USE_BLAS
+#if defined(USE_MPS)
+    /* dX[n x in] = dY[n x out] * W[out x in] */
+    tl_gpu_sgemm(0, 0, n, in, out, 1.0f, dY, out, W, in, 0.0f, dX, in);
+    tl_gpu_sync();                 /* host code reads dX immediately */
+#elif defined(USE_BLAS)
     /* dX[n x in] = dY[n x out] * W[out x in] */
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 n, in, out, 1.0f, dY, out, W, in, 0.0f, dX, in);
@@ -531,10 +566,11 @@ static void backward(Params *P, Params *G, Acts *A, const unsigned char *ix,
 }
 
 /* ------------------------------ AdamW ------------------------------- */
-static void adamw(float *p, float *g, float *m, float *v, long n, int t) {
+static void adamw_range(float *p, float *g, float *m, float *v,
+                        long lo, long hi, int t) {
     const float b1 = 0.9f, b2 = 0.999f, eps = 1e-8f;
     float c1 = 1.0f - powf(b1, (float)t), c2 = 1.0f - powf(b2, (float)t);
-    for (long i = 0; i < n; i++) {
+    for (long i = lo; i < hi; i++) {
         m[i] = b1 * m[i] + (1.0f - b1) * g[i];
         v[i] = b2 * v[i] + (1.0f - b2) * g[i] * g[i];
         float mh = m[i] / c1, vh = v[i] / c2;
@@ -607,12 +643,79 @@ static int load_ckpt(const char *path, float *pb, float *m, float *v) {
 }
 
 /* ---------------------------- sampling ------------------------------ */
+/* Programs in the corpus each begin with this exact line, so it doubles as
+ * the "a new program starts here" signal. Generation is seeded with it and
+ * stops the moment the model emits it again, which is how we carve out
+ * exactly one whole program. Override with -DPROG_MARK="\"...\"". */
+#ifndef PROG_MARK
+#define PROG_MARK "#!/usr/bin/env python3\n"
+#endif
+
 static int sample_probs(const float *p, float temp) {
     float w[MAXV], s = 0.0f, it = 1.0f / temp;
     for (int i = 0; i < VS; i++) { w[i] = powf(p[i] + 1e-12f, it); s += w[i]; }
     float r = frand() * s, c = 0.0f;
     for (int i = 0; i < VS; i++) { c += w[i]; if (r <= c) return i; }
     return VS - 1;
+}
+
+/* Generate exactly one whole program: seed with PROG_MARK, stop as soon as
+ * the model emits PROG_MARK again (that belongs to the *next* program, so it
+ * is not printed). Returns the byte length written, or -1 if it ran out of
+ * budget before finding a boundary. If savepath is non-NULL the program is
+ * also written there so you can run it. */
+static long sample_program(Params *P, Acts *A, float temp, long budget,
+                           const char *savepath) {
+    const char *mark = PROG_MARK;
+    long marklen = (long)strlen(mark);
+    unsigned char win[CTX];
+    int len = 0;
+
+    /* seed the context with the program-start marker itself */
+    for (long i = 0; i < marklen; i++) {
+        unsigned char b = (unsigned char)mark[i];
+        if (b != dec_[enc[b]]) {
+            fprintf(stderr, "sample: marker byte 0x%02x is not in the charset\n", b);
+            return -1;
+        }
+        if (len == CTX) { memmove(win, win + 1, CTX - 1); win[CTX-1] = enc[b]; }
+        else win[len++] = enc[b];
+    }
+
+    char *out = malloc((size_t)budget + marklen + 1);
+    if (!out) return -1;
+    long n = 0;
+    int complete = 0;
+    for (long s = 0; s < budget; s++) {
+        forward(P, A, win, NULL, 1, len);
+        int nx = sample_probs(A->logits + (long)(len - 1) * VS, temp);
+        out[n++] = (char)dec_[nx];
+        if (len == CTX) { memmove(win, win + 1, CTX - 1); win[CTX-1] = (unsigned char)nx; }
+        else win[len++] = (unsigned char)nx;
+        /* did we just complete the marker? then the next program has begun */
+        if (n >= marklen && memcmp(out + n - marklen, mark, (size_t)marklen) == 0) {
+            n -= marklen;               /* drop it: it belongs to the next one */
+            complete = 1;
+            break;
+        }
+    }
+    out[n] = '\0';
+
+    fputs(mark, stdout);
+    fwrite(out, 1, (size_t)n, stdout);
+    if (!complete) printf("\n[...cut off after %ld bytes: no program boundary "
+                          "found within budget]\n", n);
+
+    if (savepath) {
+        FILE *f = fopen(savepath, "wb");
+        if (f) {
+            fwrite(mark, 1, (size_t)marklen, f);
+            fwrite(out, 1, (size_t)n, f);
+            fclose(f);
+        }
+    }
+    free(out);
+    return complete ? n + marklen : -1;
 }
 
 static void sample_text(Params *P, Acts *A, const char *prompt, int n, float temp) {
@@ -659,7 +762,15 @@ static void encode_data(unsigned char *d, long n) {
                              "were mapped to id 0\n", unk);
 }
 
-/* --------------------- per-thread training worker ------------------- */
+/* --------------------- per-thread training worker -------------------
+ * NTHREADS is the compile-time maximum. The number actually used is chosen
+ * at runtime from $TINYLLM_THREADS, so you can retune without rebuilding:
+ *     TINYLLM_THREADS=2 ./tinyllm train corpus.txt model.bin 2000
+ * It must divide BATCH evenly. Each worker owns a slice of the batch for
+ * forward/backward, then a slice of the parameters for reduce+AdamW, so
+ * no part of a step is left running on one core.                       */
+static int g_threads = NTHREADS;
+
 typedef struct {
     Params *P;
     Params G;
@@ -667,13 +778,49 @@ typedef struct {
     Acts A;
     const unsigned char *ix, *tg;
     float loss;
+    int nb;                      /* sequences this worker handles       */
+    /* optimizer phase */
+    float **gbufs;               /* every worker's gradient buffer      */
+    float *pb, *gb, *m, *v;
+    long lo, hi;                 /* parameter slice                     */
+    int step, nt;
 } Worker;
 
 static void *work(void *arg) {
     Worker *w = (Worker *)arg;
-    w->loss = forward(w->P, &w->A, w->ix, w->tg, BATCH/NTHREADS, CTX);
-    backward(w->P, &w->G, &w->A, w->ix, w->tg, BATCH/NTHREADS, CTX);
+    w->loss = forward(w->P, &w->A, w->ix, w->tg, w->nb, CTX);
+    backward(w->P, &w->G, &w->A, w->ix, w->tg, w->nb, CTX);
     return NULL;
+}
+
+/* sum this slice of the gradient across workers, then step AdamW on it */
+static void *work_opt(void *arg) {
+    Worker *w = (Worker *)arg;
+    for (long i = w->lo; i < w->hi; i++) {
+        float s = 0.0f;
+        for (int t = 0; t < w->nt; t++) { s += w->gbufs[t][i]; w->gbufs[t][i] = 0.0f; }
+        w->gb[i] = s / w->nt;
+    }
+    adamw_range(w->pb, w->gb, w->m, w->v, w->lo, w->hi, w->step);
+    return NULL;
+}
+
+/* pick the runtime thread count: $TINYLLM_THREADS, clamped and validated */
+static int pick_threads(void) {
+    int n = NTHREADS;
+    const char *e = getenv("TINYLLM_THREADS");
+    if (e && *e) {
+        int v = atoi(e);
+        if (v < 1) v = 1;
+        if (v > NTHREADS) {
+            fprintf(stderr, "TINYLLM_THREADS=%d exceeds the compiled maximum "
+                            "(%d); using %d\n", v, NTHREADS, NTHREADS);
+            v = NTHREADS;
+        }
+        n = v;
+    }
+    while (n > 1 && BATCH % n) n--;      /* must divide the batch evenly */
+    return n;
 }
 
 /* ------------------------------ modes ------------------------------- */
@@ -703,13 +850,33 @@ static void train(const char *datapath, const char *modelpath, int steps) {
     }
     Params P; map_params(&P, pb);
 
+    g_threads = pick_threads();
+#ifdef USE_MPS
+    if (g_threads != 1) {
+        printf("GPU backend: using 1 CPU thread "
+               "(the device queue is shared, not thread-safe)\n");
+        g_threads = 1;
+    }
+#endif
+    int NB = BATCH / g_threads;              /* sequences per worker */
     Worker W[NTHREADS];
-    for (int t = 0; t < NTHREADS; t++) {
+    float *gbufs[NTHREADS];
+    for (int t = 0; t < g_threads; t++) {
         W[t].P = &P;
         W[t].gbuf = xcalloc(N);
+        gbufs[t] = W[t].gbuf;
         map_params(&W[t].G, W[t].gbuf);
-        alloc_acts(&W[t].A, BATCH/NTHREADS);
+        alloc_acts(&W[t].A, NB);
+        W[t].nb = NB;
+        W[t].gbufs = gbufs;
+        W[t].pb = pb; W[t].gb = gb; W[t].m = m; W[t].v = v;
+        W[t].nt = g_threads;
+        W[t].lo = (long)t * N / g_threads;
+        W[t].hi = (long)(t + 1) * N / g_threads;
     }
+    if (g_threads != NTHREADS)
+        printf("using %d of %d compiled threads (TINYLLM_THREADS)\n",
+               g_threads, NTHREADS);
     rngs ^= (unsigned long long)time(NULL) + (unsigned long long)step * 1000003ULL;
 
     unsigned char ix[BATCH*CTX], tg[BATCH*CTX];
@@ -721,27 +888,36 @@ static void train(const char *datapath, const char *modelpath, int steps) {
             memcpy(ix + b*CTX, data + off, CTX);
             memcpy(tg + b*CTX, data + off + 1, CTX);
         }
-        for (int t = 0; t < NTHREADS; t++) {
-            W[t].ix = ix + (long)t * (BATCH/NTHREADS) * CTX;
-            W[t].tg = tg + (long)t * (BATCH/NTHREADS) * CTX;
+        for (int t = 0; t < g_threads; t++) {
+            W[t].ix = ix + (long)t * NB * CTX;
+            W[t].tg = tg + (long)t * NB * CTX;
         }
 #if NTHREADS > 1
         pthread_t th[NTHREADS];
-        for (int t = 0; t < NTHREADS; t++) pthread_create(&th[t], NULL, work, &W[t]);
-        for (int t = 0; t < NTHREADS; t++) pthread_join(th[t], NULL);
+        if (g_threads > 1) {
+            for (int t = 0; t < g_threads; t++) pthread_create(&th[t], NULL, work, &W[t]);
+            for (int t = 0; t < g_threads; t++) pthread_join(th[t], NULL);
+        } else work(&W[0]);
 #else
         work(&W[0]);
 #endif
         float loss = 0.0f;
-        for (int t = 0; t < NTHREADS; t++) loss += W[t].loss;
-        loss /= NTHREADS;
-        for (long i = 0; i < N; i++) {              /* reduce worker grads */
-            float sgr = 0.0f;
-            for (int t = 0; t < NTHREADS; t++) { sgr += W[t].gbuf[i]; W[t].gbuf[i] = 0.0f; }
-            gb[i] = sgr / NTHREADS;
-        }
+        for (int t = 0; t < g_threads; t++) loss += W[t].loss;
+        loss /= g_threads;
         step++;
-        adamw(pb, gb, m, v, N, step);
+#ifdef USE_MPS
+        tl_gpu_sync();          /* gradients must land before we read them */
+#endif
+        /* reduce + AdamW, also split across the workers */
+        for (int t = 0; t < g_threads; t++) W[t].step = step;
+#if NTHREADS > 1
+        if (g_threads > 1) {
+            for (int t = 0; t < g_threads; t++) pthread_create(&th[t], NULL, work_opt, &W[t]);
+            for (int t = 0; t < g_threads; t++) pthread_join(th[t], NULL);
+        } else work_opt(&W[0]);
+#else
+        work_opt(&W[0]);
+#endif
         lsum += loss; lcnt++;
         if (step % 10 == 0 || s == steps - 1) {
             double secs = now_s() - t0;
@@ -752,9 +928,13 @@ static void train(const char *datapath, const char *modelpath, int steps) {
         }
         if (step % CKPT_EVERY == 0) save_ckpt(modelpath, pb, m, v, step);
         if (step % SAMPLE_EVERY == 0) {
-            printf("---- sample @ step %d ----\n", step);
-            sample_text(&P, &W[0].A, "\n", 200, 0.8f);
-            printf("--------------------------\n");
+            char path[512];
+            snprintf(path, sizeof path, "sample_step_%06d.py", step);
+            printf("---- whole-program sample @ step %d ----\n", step);
+            long got = sample_program(&P, &W[0].A, 0.6f, SAMPLE_BUDGET, path);
+            printf("---- %s (%s) ----\n", path,
+                   got > 0 ? "complete program" : "incomplete");
+            fflush(stdout);
         }
     }
     save_ckpt(modelpath, pb, m, v, step);
@@ -775,6 +955,25 @@ static void gen_cmd(const char *modelpath, const char *prompt, int n, float temp
     Acts A; alloc_acts(&A, 1);
     rngs ^= (unsigned long long)time(NULL);
     sample_text(&P, &A, prompt, n, temp);
+}
+
+static void prog_cmd(const char *modelpath, float temp, const char *savepath) {
+    int step = 0;
+    if (load_header(modelpath, &step) != 0) {
+        fprintf(stderr, "can't open %s — train first\n", modelpath); exit(1);
+    }
+    long N = nparams();
+    float *pb = xcalloc(N);
+    if (load_ckpt(modelpath, pb, NULL, NULL) != 0) {
+        fprintf(stderr, "failed to read %s\n", modelpath); exit(1);
+    }
+    Params P; map_params(&P, pb);
+    Acts A; alloc_acts(&A, 1);
+    rngs ^= (unsigned long long)time(NULL);
+    long got = sample_program(&P, &A, temp, SAMPLE_BUDGET, savepath);
+    if (savepath) fprintf(stderr, "\nwrote %s (%s)\n", savepath,
+                          got > 0 ? "complete" : "incomplete");
+    if (got <= 0) exit(2);
 }
 
 /* finite-difference check of the whole backward pass */
@@ -828,12 +1027,23 @@ static void check(const char *datapath) {
 
 /* ------------------------------ main -------------------------------- */
 int main(int argc, char **argv) {
+#ifdef USE_MPS
+    if (tl_gpu_init() != 0) {
+        fprintf(stderr, "no usable GPU; rebuild without -DUSE_MPS\n");
+        return 1;
+    }
+    fprintf(stderr, "GPU backend: %s\n", tl_gpu_name());
+    atexit(tl_gpu_shutdown);
+#endif
     if (argc >= 4 && !strcmp(argv[1], "train")) {
         train(argv[2], argv[3], argc > 4 ? atoi(argv[4]) : 1000);
     } else if (argc >= 3 && !strcmp(argv[1], "gen")) {
         gen_cmd(argv[2], argc > 3 ? argv[3] : "\n",
                 argc > 4 ? atoi(argv[4]) : 400,
                 argc > 5 ? (float)atof(argv[5]) : 0.8f);
+    } else if (argc >= 3 && !strcmp(argv[1], "prog")) {
+        prog_cmd(argv[2], argc > 3 ? (float)atof(argv[3]) : 0.6f,
+                 argc > 4 ? argv[4] : NULL);
     } else if (argc >= 3 && !strcmp(argv[1], "check")) {
         check(argv[2]);
     } else {
@@ -841,7 +1051,8 @@ int main(int argc, char **argv) {
             "usage:\n"
             "  %s train <data.txt> <model.bin> [steps=1000]\n"
             "  %s gen   <model.bin> [prompt] [ntokens=400] [temp=0.8]\n"
-            "  %s check <data.txt>\n", argv[0], argv[0], argv[0]);
+            "  %s prog  <model.bin> [temp=0.6] [out.py]   one whole program\n"
+            "  %s check <data.txt>\n", argv[0], argv[0], argv[0], argv[0]);
         return 1;
     }
     return 0;
