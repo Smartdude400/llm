@@ -45,7 +45,7 @@ jobs:
       - name: Build large model (dim 256, 4 layers)
         run: |
           clang -O3 -ffast-math -DDIM=256 -DNLAYER=4 -DCTX=128 -DBATCH=16 \
-                -pthread -DNTHREADS=4 \
+                -pthread -DNTHREADS=16 \
                 -DUSE_BLAS -framework Accelerate \
                 -o tinyllm-big tinyllm.c
           ./tinyllm-big check tinyllm.c
@@ -56,7 +56,7 @@ jobs:
         id: gpu_build
         continue-on-error: true
         run: |
-          clang -O3 -ffast-math -DUSE_MPS -DCTX=128 -DBATCH=16 \
+          clang -O3 -ffast-math -DUSE_MPS -DCTX=128 -DBATCH=32 \
                 -fobjc-arc \
                 -framework Metal -framework MetalPerformanceShaders \
                 -framework Foundation \
